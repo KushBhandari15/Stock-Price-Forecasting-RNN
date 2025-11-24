@@ -119,17 +119,28 @@ def cci(data, window=20):
     cci_values = (tp - sma) / (0.015 * mean_deviation)
     return cci_values.to_frame("CCI")
 
-def obv(data):
-    obv = [0]
-    for i in range(1, len(data)):
-        if data['Close'].iloc[i] > data['Close'].iloc[i - 1]:
-            obv.append(obv[-1] + data['Volume'].iloc[i])
-        elif data['Close'].iloc[i] < data['Close'].iloc[i - 1]:
-            obv.append(obv[-1] - data['Volume'].iloc[i])
-        else:
-            obv.append(obv[-1])
-
-    return pd.Series(obv, index=data.index, name="OBV")
+def obv(data, window=20):
+    """
+    Calculates OBV and then normalizes it using a Rolling Z-Score
+    to make it stationary and scale-compatible with Log Returns.
+    """
+    # 1. Standard OBV Calculation
+    close_diff = data['Close'].diff()
+    direction = np.where(close_diff > 0, 1, -1)
+    direction[close_diff == 0] = 0
+    
+    volume_flow = direction * data['Volume'] 
+    obv_raw = volume_flow.cumsum()
+    
+    # 2. Make it Stationary (Rolling Z-Score)
+    # (Value - Mean) / Std
+    rolling_mean = obv_raw.rolling(window=window).mean()
+    rolling_std = obv_raw.rolling(window=window).std()
+    
+    # Add epsilon to avoid division by zero
+    obv_stationary = (obv_raw - rolling_mean) / (rolling_std + 1e-9)
+    
+    return obv_stationary.to_frame("OBV")
 
 def get_all_data(start_date="2015-01-01", end_date="2024-01-01"):
 
@@ -152,10 +163,19 @@ def get_all_data(start_date="2015-01-01", end_date="2024-01-01"):
         ticker_df['Date'] = pd.to_datetime(ticker_df['Date'])
         ticker_df.set_index('Date', inplace=True)
         ticker_df = ticker_df[~ticker_df.index.duplicated(keep='first')]
+
         if isinstance(ticker_df['Close'], pd.DataFrame):
-            ticker_df['Close'] = ticker_df['Close'].iloc[:,0]
+            ticker_df['Close'] = ticker_df['Close'].iloc[:, 0]
+        if isinstance(ticker_df['Volume'], pd.DataFrame):
+            ticker_df['Volume'] = ticker_df['Volume'].iloc[:, 0]
+        if isinstance(ticker_df['High'], pd.DataFrame):
+            ticker_df['High'] = ticker_df['High'].iloc[:, 0]
+        if isinstance(ticker_df['Low'], pd.DataFrame):
+            ticker_df['Low'] = ticker_df['Low'].iloc[:, 0]
+        if isinstance(ticker_df['Open'], pd.DataFrame):
+            ticker_df['Open'] = ticker_df['Open'].iloc[:, 0]
+
         ticker_df['Change'] = ticker_df['Close'].pct_change(fill_method=None)
-        ticker_df['Ticker'] = ticker
         RSI = rsi(data=ticker_df)
         MACD = macd(data=ticker_df)
         EMA = ema_ratio(data=ticker_df)
@@ -167,6 +187,15 @@ def get_all_data(start_date="2015-01-01", end_date="2024-01-01"):
         ticker_df.drop(columns=['Dividends', 'Stock Splits', 'Adj Close'], inplace=True, errors='ignore')
         ticker_df = pd.concat([ticker_df, RSI, MACD, EMA, CCI, OBV, BB, ATR, AD], axis=1)
         ticker_df['Target'] = ticker_df['Close'].pct_change(fill_method=None).shift(-1)
+        cols_to_log = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in cols_to_log:
+            if col in ticker_df.columns:
+                current_val = ticker_df[col] + 1e-9
+                prev_val = ticker_df[col].shift(1) + 1e-9
+                ticker_df[col] = np.log(current_val / prev_val)
+
+        ticker_df['Ticker'] = ticker
+        ticker_df.replace([np.inf, -np.inf], 0, inplace=True)
         ticker_df.dropna(inplace=True)
         ticker_df['Target']= ticker_df['Target'].clip(lower=-0.5, upper=0.5)
 

@@ -1,47 +1,53 @@
-from data_processing import get_all_data
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.preprocessing import MinMaxScaler, RobustScaler
+from sklearn.preprocessing import StandardScaler
+import xgboost as xgb
+import joblib
 
-class Directonal_MSELoss(nn.Module):
-    def __init__(self, alpha=10.0):
-        super(Directonal_MSELoss, self).__init__()
-        self.mse = nn.MSELoss()
-        self.alpha = alpha
-
-    def forward(self, predictions, targets):
-        mse_loss = self.mse(predictions, targets)
-        directional_error = torch.tanh(predictions) * torch.tanh(targets)
-        direction_penalty = torch.mean(torch.relu(-1 * directional_error))
-        return mse_loss + torch.mean(direction_penalty * self.alpha)
-    
 class Forecasting_Model:
 
     def __init__(self):
         self.data = pd.read_csv('stock_data.csv')
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print("Using device:", self.device)
+        
+        # Model placeholders
         self.model = None
+        self.hybrid_model = None
+        
+        # Data placeholders (Loaded ONCE)
+        self.train_loader = None
+        self.val_loader = None
+        self.test_loader = None
+        
+        # Scalers & Arrays
+        self.X_scaler = StandardScaler()
+        self.y_scaler = StandardScaler()
+        self.X_test_xgb = None
+        self.y_test_xgb = None
 
     def create_windows(self, window_size=10):
-        
         tickers = self.data['Ticker'].unique()
-        combined_df = self.data
-        combined_df['Date'] = pd.to_datetime(combined_df['Date'])
-        combined_df = combined_df.set_index('Date').sort_index()
+        combined_df = self.data.copy()
+        if 'Date' in combined_df.columns:
+            combined_df['Date'] = pd.to_datetime(combined_df['Date'])
+            combined_df = combined_df.set_index('Date').sort_index()
 
         X_data_list = []
         y_data_list = []
 
+        print("Creating windows")
         for ticker in tickers:
             ticker_df = combined_df[combined_df['Ticker'] == ticker].drop(columns=['Ticker'])
-            ticker_df.dropna(inplace=True)
-
-            X_ticker = ticker_df.drop(columns=['Target']).values
-            y_ticker = ticker_df['Target'].values
+            
+            # Ensure numeric
+            try:
+                X_ticker = ticker_df.drop(columns=['Target']).values.astype(float)
+                y_ticker = ticker_df['Target'].values.astype(float)
+            except:
+                continue
 
             if len(X_ticker) < window_size:
                 continue
@@ -57,177 +63,242 @@ class Forecasting_Model:
 
         X_final = np.concatenate(X_data_list, axis=0)
         y_final = np.concatenate(y_data_list, axis=0)
-
         return X_final, y_final
     
-    def pre_processing(self):
-
+    def prepare_data(self):
         X, y = self.create_windows(window_size=10)
-        total_len = len(X)
-        train_ratio = 0.7
-        val_ratio = 0.15
-        test_ratio = 0.15
-
-        train_end_idx = int(total_len * train_ratio)
-        val_end_idx = int(total_len * (train_ratio + val_ratio))
-
-        X_train_raw = X[:train_end_idx]
-        y_train_raw = y[:train_end_idx]
-        X_val_raw = X[train_end_idx:val_end_idx]
-        y_val_raw = y[train_end_idx:val_end_idx]
-        X_test_raw = X[val_end_idx:]
-        y_test_raw = y[val_end_idx:]
-
-        n_features = X_train_raw.shape[2]
-        X_train_2D = X_train_raw.reshape(-1, n_features)
-
-        # Initialize scalers
-        X_scaler = MinMaxScaler(feature_range=(-1, 1))
-        y_scaler = MinMaxScaler(feature_range=(-1, 1))
-
-        # Fit scalers
-        X_scaler.fit(X_train_2D)
-        y_scaler.fit(y_train_raw.reshape(-1, 1)) # y must be 2D for the scaler
-
-        # Transform all sets
-        X_train = X_scaler.transform(X_train_raw.reshape(-1, n_features)).reshape(X_train_raw.shape)
-        X_val = X_scaler.transform(X_val_raw.reshape(-1, n_features)).reshape(X_val_raw.shape)
-        X_test = X_scaler.transform(X_test_raw.reshape(-1, n_features)).reshape(X_test_raw.shape)
-
-        # y does not need reshaping after transformation, only before and during fit/transform
-        y_train = y_scaler.transform(y_train_raw.reshape(-1, 1)).flatten()
-        y_val = y_scaler.transform(y_val_raw.reshape(-1, 1)).flatten()
-        y_test = y_scaler.transform(y_test_raw.reshape(-1, 1)).flatten()
         
-        # 4. Convert to PyTorch Tensors
-        X_train_tensor = torch.from_numpy(X_train).float()
-        y_train_tensor = torch.from_numpy(y_train).float().unsqueeze(1)
-        X_val_tensor = torch.from_numpy(X_val).float()
-        y_val_tensor = torch.from_numpy(y_val).float().unsqueeze(1)
-        X_test_tensor = torch.from_numpy(X_test).float()
-        y_test_tensor = torch.from_numpy(y_test).float().unsqueeze(1)
+        total_len = len(X)
+        train_end = int(total_len * 0.7)
+        val_end = int(total_len * 0.85)
 
-        return (X_train_tensor, y_train_tensor,
-                X_val_tensor, y_val_tensor,
-                X_test_tensor, y_test_tensor,
-                y_scaler)
+        # Split raw data
+        X_train_raw = X[:train_end]
+        y_train_raw = y[:train_end]
+        X_val_raw = X[train_end:val_end]
+        y_val_raw = y[train_end:val_end]
+        X_test_raw = X[val_end:]
+        y_test_raw = y[val_end:]
+
+        # Reshape for scaling
+        n_features = X_train_raw.shape[2]
+        
+        # Fit Scalers ONLY on Training Data
+        self.X_scaler.fit(X_train_raw.reshape(-1, n_features))
+        self.y_scaler.fit(y_train_raw.reshape(-1, 1))
+
+        # Transform
+        def scale_X(data):
+            return self.X_scaler.transform(data.reshape(-1, n_features)).reshape(data.shape)
+        
+        X_train = scale_X(X_train_raw)
+        X_val = scale_X(X_val_raw)
+        X_test = scale_X(X_test_raw)
+        
+        y_train = self.y_scaler.transform(y_train_raw.reshape(-1, 1)).flatten()
+        y_val = self.y_scaler.transform(y_val_raw.reshape(-1, 1)).flatten()
+        y_test = self.y_scaler.transform(y_test_raw.reshape(-1, 1)).flatten()
+
+        # Create Loaders (Saved to Self)
+        self.train_loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(torch.from_numpy(X_train).float().to(self.device), 
+                                           torch.from_numpy(y_train).float().to(self.device)), 
+            batch_size=64, shuffle=True
+        )
+        
+        self.val_loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(torch.from_numpy(X_val).float().to(self.device), 
+                                           torch.from_numpy(y_val).float().to(self.device)), 
+            batch_size=64, shuffle=False
+        )
+        
+        self.test_loader = torch.utils.data.DataLoader(
+            torch.utils.data.TensorDataset(torch.from_numpy(X_test).float().to(self.device), 
+                                           torch.from_numpy(y_test).float().to(self.device)), 
+            batch_size=64, shuffle=False
+        )
+        
+        print("✅ Data Preparation Complete.")
 
     def setup_model(self, input_size, hidden_size, num_layers, output_size):
-
         class LSTM(nn.Module):
             def __init__(self, input_size, hidden_size, num_layers, output_size):
                 super(LSTM, self).__init__()
-                self.hidden_size = hidden_size
-                self.num_layers = num_layers
-
                 self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-                self.attention_weights = nn.Linear(hidden_size, 1)
-                self.fc1 = nn.Linear(hidden_size, hidden_size//2)
-                self.relu = nn.ReLU()
                 self.dropout = nn.Dropout(0.2)
+                self.fc1 = nn.Linear(hidden_size, hidden_size//2)
+                self.tanh = nn.Tanh()
                 self.fc2 = nn.Linear(hidden_size//2, output_size)
-
 
             def forward(self, x):
                 out, _ = self.lstm(x)
-                attn_score = self.attention_weights(out)
-                attn_weights = torch.softmax(attn_score, dim=1)
-                context = torch.sum(attn_weights * out, dim=1)
-                # out = out[:, -1, :]
-                out = self.fc1(context)
-                out = self.relu(out)
+                last_step = out[:, -1, :]  # (batch_size, hidden_size)
+                # Head
+                out = self.fc1(last_step)
+                out = self.tanh(out)
                 out = self.dropout(out)
-                out = self.fc2(out)
-                return out
+                prediction = self.fc2(out)
+                return prediction, last_step  # Return context for XGBoost
             
         return LSTM(input_size, hidden_size, num_layers, output_size).to(self.device)
     
-    def train_model(self, num_epochs=50, learning_rate=0.001):
+    def train_LSTM_model(self, num_epochs=30, learning_rate=0.001):
+        print("\n--- Phase 1: Training LSTM ---")
+        
+        # Get input size from a sample batch
+        sample_X, _ = next(iter(self.train_loader))
+        input_size = sample_X.shape[2]
 
-        X_train, y_train, X_val, y_val, _, _, _ = self.pre_processing()
-        X_train = X_train.to(self.device); y_train = y_train.to(self.device)
-        X_val = X_val.to(self.device); y_val = y_val.to(self.device)
-
-        input_size = X_train.shape[2]
         self.model = self.setup_model(input_size, hidden_size=128, num_layers=2, output_size=1)
+        
         criterion = nn.MSELoss()
-        # criterion = Directonal_MSELoss(alpha=0.5)
-        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
-
-        train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=64, shuffle=False)
-        val_dataset = torch.utils.data.TensorDataset(X_val, y_val)
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=64, shuffle=False)
+        optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-4)
 
         for epoch in range(num_epochs):
             self.model.train()
-            total_training_loss = 0.0
+            total_loss = 0.0
 
-            for X_batch, y_batch in train_loader:
+            for X_batch, y_batch in self.train_loader:
                 optimizer.zero_grad()
-                predictions = self.model(X_batch)
-                loss = criterion(predictions, y_batch)
+                preds, _ = self.model(X_batch)
+                loss = criterion(preds, y_batch.unsqueeze(1)) # Ensure shape match
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
-                total_training_loss += loss.item() * X_batch.size(0)
+                total_loss += loss.item()
 
-            avg_training_loss = total_training_loss / len(train_dataset)
-
-            total_val_loss = 0.0
-            self.model.eval()
-            with torch.no_grad():
-                for X_batch_val, y_batch_val in val_loader:
-                    val_predictions = self.model(X_batch_val)
-                    val_loss = criterion(val_predictions, y_batch_val)
-                    total_val_loss += val_loss.item() * X_batch_val.size(0)
+            avg_loss = total_loss / len(self.train_loader)
             
-            avg_val_loss = total_val_loss / len(val_dataset)
-            if (epoch + 1) % 10 == 0 or epoch == 0:
-                print(f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_training_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+            if (epoch+1) % 5 == 0 or epoch == 0:
+                print(f"Epoch {epoch+1}/{num_epochs} | Loss: {avg_loss:.6f}")
 
-        print(f"\nFinal Training Complete. Average Validation Loss: {avg_val_loss:.6f}")
+        self.evaluate_LSTM_model()
 
-    def evaluate_model(self):
-
-        _, _, _, _, X_test, y_test, y_scaler = self.pre_processing()
-
-        X_test = X_test.to(self.device); y_test = y_test.to(self.device)
-        test_dataset = torch.utils.data.TensorDataset(X_test, y_test)
-        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=256, shuffle=False)
-
+    def extract_features(self, loader):
+            self.model.eval()
+            features = []
+            targets = []
+            with torch.no_grad():
+                for X_b, y_b in loader:
+                    _, context = self.model(X_b)
+                    features.append(context.cpu().numpy())
+                    targets.append(y_b.cpu().numpy())
+            return np.vstack(features), np.concatenate(targets)
+    
+    def train_XGB_model(self):
+        print("\n--- Phase 2: Training XGBoost ---")
         self.model.eval()
-        total_test_loss = 0.0
-        test_predictions_list = []
-        test_targets_list = []
+
+        print("Extracting features...")
+        X_train_xgb, y_train_xgb = self.extract_features(self.train_loader)
+        X_val_xgb, y_val_xgb = self.extract_features(self.val_loader)
+        self.X_test_xgb, self.y_test_xgb = self.extract_features(self.test_loader)
+
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=2000,
+            learning_rate=0.005,
+            max_depth=6,
+            subsample=0.6,
+            colsample_bytree=0.8,
+            n_jobs=-1,
+            early_stopping_rounds=50,
+            random_state=42
+        )
+
+        xgb_model.fit(
+            X_train_xgb, y_train_xgb,
+            eval_set=[(X_val_xgb, y_val_xgb)],
+            verbose=False
+        )
+        print("XGBoost Training Complete.")
+        return xgb_model
+
+    def evaluate_LSTM_model(self):
+        print("\n--- Evaluating LSTM Baseline ---")
+        self.model.eval()
+        preds = []
+        targets = []
         with torch.no_grad():
-            for X_batch_test, y_batch_test in test_loader:
-                test_predictions = self.model(X_batch_test)
-                test_predictions_list.append(test_predictions.cpu().numpy())
-                test_targets_list.append(y_batch_test.cpu().numpy())
-                loss = nn.MSELoss()(test_predictions, y_batch_test)
-                total_test_loss += loss.item() * X_batch_test.size(0)
+            for X_b, y_b in self.test_loader:
+                p, _ = self.model(X_b)
+                preds.append(p.cpu().numpy())
+                targets.append(y_b.cpu().numpy())
+        
+        preds = np.vstack(preds)
+        targets = np.concatenate(targets).reshape(-1, 1)
+        
+        # INVERSE TRANSFORM
+        real_preds = self.y_scaler.inverse_transform(preds)
+        real_targets = self.y_scaler.inverse_transform(targets)
 
-        predictions_scaled = np.vstack(test_predictions_list)
-        targets_scaled = np.vstack(test_targets_list)
+        # Debug Check
+        print(f"Sample Preds: {real_preds[:5].flatten()}")
+        
+        da = np.mean(np.sign(real_preds) == np.sign(real_targets)) * 100
+        rmse = np.sqrt(np.mean((real_targets - real_preds)**2))
+        print(f"LSTM RMSE: {rmse:.6f} | LSTM DA: {da:.2f}%")
 
-        avg_test_loss = total_test_loss / len(test_dataset)
-        print(f"\nFinal Test Loss (MSE on scaled data): {avg_test_loss:.6f}")
+    def evaluate_hybrid_model(self):
+        print("\n--- Evaluating Hybrid Model ---")
+        preds = self.hybrid_model.predict(self.X_test_xgb).reshape(-1, 1)
+        
+        # INVERSE TRANSFORM
+        real_preds = self.y_scaler.inverse_transform(preds)
+        real_targets = self.y_scaler.inverse_transform(self.y_test_xgb.reshape(-1, 1))
 
-        predictions_real = y_scaler.inverse_transform(predictions_scaled)
-        targets_real = y_scaler.inverse_transform(targets_scaled)
-        rmse = np.sqrt(np.mean((targets_real - predictions_real)**2))
-        print(f"Test RMSE (on scaled data): {rmse:.6f}")
-        correct_direction = np.sign(predictions_real) == np.sign(targets_real)
-        directional_accuracy = np.sum((correct_direction) / len(y_test))*100
-        print(f"Test Directional Accuracy (DA): {directional_accuracy:.2f}%")
+        print(f"Sample Preds: {real_preds[:5].flatten()}")
 
-        return rmse, directional_accuracy
+        da = np.mean(np.sign(real_preds) == np.sign(real_targets)) * 100
+        rmse = np.sqrt(np.mean((real_targets - real_preds)**2))
+        print(f"Hybrid RMSE: {rmse:.6f} | Hybrid DA: {da:.2f}%")
+
+    def get_feature_importance(self):
+        
+        def get_rmse(X_input, y_target):
+            loader = torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(torch.from_numpy(X_input).float().to(self.device), 
+                                               torch.from_numpy(y_target).float().to(self.device)), 
+                batch_size=64, shuffle=False
+            )
+            X_xgb, _ = self.extract_features(loader)
+            preds = self.hybrid_model.predict(X_xgb).reshape(-1, 1)
+            real_preds = self.y_scaler.inverse_transform(preds)
+            real_targets = self.y_scaler.inverse_transform(y_target.reshape(-1, 1))
+
+            return np.sqrt(np.mean((real_targets-real_preds)**2))
+        
+        X_val, y_val = self.val_loader.dataset.tensors[0].cpu().numpy(), self.val_loader.dataset.tensors[1].cpu().numpy()
+        baseline_rmse = get_rmse(X_val, y_val)
+        feature_names = ['Open', 'High', 'Low', 'Close', 'Volume', 'Change',
+                         'RSI', 'MACD', 'EMA_ratio', 'CCI', 'OBV', 'BB', 'ATR', 'AD']
+        result = []
+        num_features = X_val.shape[2]
+        for i in range(num_features):
+            X_temp = X_val.copy()
+            np.random.shuffle(X_temp[:,:,i])
+            shuffled_rmse = get_rmse(X_temp, y_val)
+            importance = shuffled_rmse - baseline_rmse
+            feat_name = feature_names[i] if i < len(feature_names) else f"Feat {i}"
+            result.append((feat_name, importance))
+            print(f"   {feat_name}: +{importance:.6f} (RMSE: {shuffled_rmse:.6f})")
+
+        result.sort(key=lambda x: x[1], reverse=True)
+        print("\n--- Final Feature Importance (Top is Most Critical) ---")
+        for name, score in result:
+            print(f"{name:<15} | Impact: {score:.6f}")
 
     def execute_pipeline(self):
+        self.prepare_data() 
+        self.train_LSTM_model(num_epochs=20, learning_rate=0.001)
+        self.hybrid_model = self.train_XGB_model()
+        self.evaluate_hybrid_model()
+        self.get_feature_importance()
+        torch.save(self.model.state_dict(), 'lstm_model.pth')
+        self.hybrid_model.save_model('hybrid_model.json')
+        joblib.dump(self.X_scaler, 'X_scaler.gz')
+        joblib.dump(self.y_scaler, 'y_scaler.gz')
 
-        self.train_model(num_epochs=30, learning_rate=0.001)
-        self.evaluate_model()
-        torch.save(self.model.state_dict(), 'forecasting_model.pth')
+    
 
 if __name__ == "__main__":
     forecasting_model = Forecasting_Model()
