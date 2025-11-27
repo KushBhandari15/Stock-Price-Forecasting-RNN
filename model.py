@@ -194,17 +194,28 @@ class Forecasting_Model:
         X_val_xgb, y_val_xgb = self.extract_features(self.val_loader)
         self.X_test_xgb, self.y_test_xgb = self.extract_features(self.test_loader)
 
+        # xgb_model = xgb.XGBRegressor(
+        #     n_estimators=2000,
+        #     learning_rate=0.005,
+        #     max_depth=6,
+        #     subsample=0.6,
+        #     colsample_bytree=0.8,
+        #     n_jobs=-1,
+        #     early_stopping_rounds=50,
+        #     random_state=42
+        # )
         xgb_model = xgb.XGBRegressor(
-            n_estimators=2000,
-            learning_rate=0.005,
-            max_depth=6,
-            subsample=0.6,
-            colsample_bytree=0.8,
+            n_estimators=1000,
+            learning_rate=0.01,
+            max_depth=5,            # Increased from 4 to 5 (Trends are more complex than noise)
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=0.1,          # L1 Regularization (Keep this to kill bad features)
+            reg_lambda=0.5,         # Reduced L2 slightly (allow for larger target values)
             n_jobs=-1,
             early_stopping_rounds=50,
             random_state=42
         )
-
         xgb_model.fit(
             X_train_xgb, y_train_xgb,
             eval_set=[(X_val_xgb, y_val_xgb)],

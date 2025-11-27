@@ -186,7 +186,8 @@ def get_all_data(start_date="2015-01-01", end_date="2024-01-01"):
         AD = accumulation_distribution(data=ticker_df)
         ticker_df.drop(columns=['Dividends', 'Stock Splits', 'Adj Close'], inplace=True, errors='ignore')
         ticker_df = pd.concat([ticker_df, RSI, MACD, EMA, CCI, OBV, BB, ATR, AD], axis=1)
-        ticker_df['Target'] = ticker_df['Close'].pct_change(fill_method=None).shift(-1)
+        # ticker_df['Target'] = ticker_df['Close'].pct_change(fill_method=None).shift(-1)
+        ticker_df['Target'] = (ticker_df['Close'].shift(-3) / ticker_df['Close']) - 1.0
         cols_to_log = ['Open', 'High', 'Low', 'Close', 'Volume']
         for col in cols_to_log:
             if col in ticker_df.columns:
@@ -197,7 +198,7 @@ def get_all_data(start_date="2015-01-01", end_date="2024-01-01"):
         ticker_df['Ticker'] = ticker
         ticker_df.replace([np.inf, -np.inf], 0, inplace=True)
         ticker_df.dropna(inplace=True)
-        ticker_df['Target']= ticker_df['Target'].clip(lower=-0.5, upper=0.5)
+        ticker_df['Target']= ticker_df['Target'].clip(lower=-0.15, upper=0.15)
 
         all_data.append(ticker_df)
 
