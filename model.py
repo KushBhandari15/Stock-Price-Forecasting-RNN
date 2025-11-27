@@ -66,7 +66,7 @@ class Forecasting_Model:
         return X_final, y_final
     
     def prepare_data(self):
-        X, y = self.create_windows(window_size=10)
+        X, y = self.create_windows(window_size=30)
         
         total_len = len(X)
         train_end = int(total_len * 0.7)
@@ -149,7 +149,7 @@ class Forecasting_Model:
         sample_X, _ = next(iter(self.train_loader))
         input_size = sample_X.shape[2]
 
-        self.model = self.setup_model(input_size, hidden_size=128, num_layers=2, output_size=1)
+        self.model = self.setup_model(input_size, hidden_size=128, num_layers=3, output_size=1)
         
         criterion = nn.MSELoss()
         optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-4)

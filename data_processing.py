@@ -212,5 +212,36 @@ def get_all_data(start_date="2015-01-01", end_date="2024-01-01"):
 
     return combined
 
+def get_ticker_data(ticker, is_log = True):
+
+    data = yf.Ticker(ticker).history(period="100d")
+    if data.empty:
+        raise ValueError(f"No data found for {ticker}")
+    
+    data = data.reset_index()        
+    data['Date'] = pd.to_datetime(data['Date'])
+    data.set_index('Date', inplace=True)
+    RSI = rsi(data=data)
+    MACD = macd(data=data)
+    EMA = ema_ratio(data=data)
+    CCI = cci(data=data)
+    OBV = obv(data=data)
+    BB = bollinger_bands(data=data)
+    ATR = atr(data=data)
+    AD = accumulation_distribution(data=data)
+    data.drop(columns=['Dividends', 'Stock Splits', 'Adj Close', 'Capital Gains'], inplace=True, errors='ignore')
+    data['Change'] = data['Close'].pct_change(fill_method=None)
+    cumulative = pd.concat([data, RSI, MACD, EMA, CCI, OBV, BB, ATR, AD], axis=1)
+
+    if is_log:
+        cols_to_log = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in cols_to_log:
+            if col in cumulative.columns:
+                current_val = cumulative[col] + 1e-9
+                prev_val = cumulative[col].shift(1) + 1e-9
+                cumulative[col] = np.log(current_val/prev_val)
+    cumulative.dropna(inplace=True)
+    return cumulative.astype(float)
+
 if __name__ == "__main__":
     get_all_data()
